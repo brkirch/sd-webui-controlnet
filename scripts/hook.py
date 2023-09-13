@@ -13,7 +13,7 @@ from modules import devices, lowvram, shared, scripts
 
 cond_cast_unet = getattr(devices, 'cond_cast_unet', lambda x: x)
 
-from ldm.modules.diffusionmodules.util import timestep_embedding
+from ldm.modules.diffusionmodules.util import timestep_embedding, make_beta_schedule
 from ldm.modules.diffusionmodules.openaimodel import UNetModel
 from ldm.modules.attention import BasicTransformerBlock
 from ldm.models.diffusion.ddpm import extract_into_tensor
@@ -25,7 +25,7 @@ from modules.processing import StableDiffusionProcessing
 try:
     from sgm.modules.attention import BasicTransformerBlock as BasicTransformerBlockSGM
 except:
-    print('Webui version too old!')
+    print('Warning: ControlNet failed to load SGM - will use LDM instead.')
     BasicTransformerBlockSGM = BasicTransformerBlock
 
 
@@ -142,6 +142,7 @@ class ControlModelType(Enum):
     ControlLoRA = "ControlLoRA, Wu Hecong"
     ReVision = "ReVision, Stability"
     IPAdapter = "IPAdapter, Hu Ye"
+    Controlllite = "Controlllite, Kohya"
 
 
 # Written by Lvmin
@@ -217,6 +218,7 @@ class ControlParams:
         self.used_hint_inpaint_hijack = None
         self.soft_injection = soft_injection
         self.cfg_injection = cfg_injection
+        self.vision_hint_count = None
 
     @property
     def hint_cond(self):
@@ -263,6 +265,45 @@ def torch_dfs(model: torch.nn.Module):
     for child in model.children():
         result += torch_dfs(child)
     return result
+
+
+class AbstractLowScaleModel(nn.Module):
+    def __init__(self):
+        super(AbstractLowScaleModel, self).__init__()
+        self.register_schedule()
+
+    def register_schedule(self, beta_schedule="linear", timesteps=1000,
+                          linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
+        betas = make_beta_schedule(beta_schedule, timesteps, linear_start=linear_start, linear_end=linear_end,
+                                   cosine_s=cosine_s)
+        alphas = 1. - betas
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.linear_start = linear_start
+        self.linear_end = linear_end
+        assert alphas_cumprod.shape[0] == self.num_timesteps, 'alphas have to be defined for each timestep'
+
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+
+        self.register_buffer('betas', to_torch(betas))
+        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
+        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        return (extract_into_tensor(self.sqrt_alphas_cumprod.to(x_start), t, x_start.shape) * x_start +
+                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod.to(x_start), t, x_start.shape) * noise)
 
 
 def register_schedule(self):
@@ -340,7 +381,6 @@ class UnetHook(nn.Module):
         self.gn_auto_machine_weight = 1.0
         self.current_style_fidelity = 0.0
         self.current_uc_indices = None
-        self.global_revision = None
 
     @staticmethod
     def call_vae_using_process(p, x, batch_size=None, mask=None):
@@ -384,6 +424,8 @@ class UnetHook(nn.Module):
         for param in self.control_params:
             current_sampling_percent = (x.sampling_step / x.total_sampling_steps)
             param.guidance_stopped = current_sampling_percent < param.start_guidance_percent or current_sampling_percent > param.stop_guidance_percent
+            if self.model is not None:
+                self.model.current_sampling_percent = current_sampling_percent
 
     def hook(self, model, sd_ldm, control_params, process):
         self.model = model
@@ -425,10 +467,25 @@ class UnetHook(nn.Module):
             # logger.info(str(cond_mark[:, 0, 0, 0].detach().cpu().numpy().tolist()) + ' - ' + str(outer.current_uc_indices))
 
             # Revision
-            if is_sdxl and isinstance(outer.global_revision, torch.Tensor):
-                y[:, :1280] = outer.global_revision * cond_mark[:, :, 0, 0]
-                if any('ignore_prompt' in param.preprocessor['name'] for param in outer.control_params):
-                    context = torch.zeros_like(context)
+            if is_sdxl:
+                revision_y1280 = 0
+
+                for param in outer.control_params:
+                    if param.guidance_stopped:
+                        continue
+                    if param.control_model_type == ControlModelType.ReVision:
+                        if param.vision_hint_count is None:
+                            k = torch.Tensor([int(param.preprocessor['threshold_a'] * 1000)]).to(param.hint_cond).long().clip(0, 999)
+                            param.vision_hint_count = outer.revision_q_sampler.q_sample(param.hint_cond, k)
+                        revision_emb = param.vision_hint_count
+                        if isinstance(revision_emb, torch.Tensor):
+                            revision_y1280 += revision_emb * param.weight
+
+                if isinstance(revision_y1280, torch.Tensor):
+                    y[:, :1280] = revision_y1280 * cond_mark[:, :, 0, 0]
+                    if any('ignore_prompt' in param.preprocessor['name'] for param in outer.control_params) \
+                            or (getattr(process, 'prompt', '') == '' and getattr(process, 'negative_prompt', '') == ''):
+                        context = torch.zeros_like(context)
 
             # High-res fix
             for param in outer.control_params:
@@ -439,7 +496,7 @@ class UnetHook(nn.Module):
                     param.used_hint_inpaint_hijack = None
 
                 # has high-res fix
-                if param.hr_hint_cond is not None and x.ndim == 4 and param.hint_cond.ndim == 4 and param.hr_hint_cond.ndim == 4:
+                if isinstance(param.hr_hint_cond, torch.Tensor) and x.ndim == 4 and param.hint_cond.ndim == 4 and param.hr_hint_cond.ndim == 4:
                     _, _, h_lr, w_lr = param.hint_cond.shape
                     _, _, h_hr, w_hr = param.hr_hint_cond.shape
                     _, _, h, w = x.shape
@@ -457,6 +514,7 @@ class UnetHook(nn.Module):
                             param.used_hint_cond_latent = None
                             param.used_hint_inpaint_hijack = None
 
+            self.is_in_high_res_fix = is_in_high_res_fix
             no_high_res_control = is_in_high_res_fix and shared.opts.data.get("control_net_no_high_res_fix", False)
 
             # Convert control image to latent
@@ -471,6 +529,9 @@ class UnetHook(nn.Module):
 
             # vram
             for param in outer.control_params:
+                if getattr(param.control_model, 'disable_memory_management', False):
+                    continue
+
                 if param.control_model is not None:
                     if outer.lowvram and is_sdxl and hasattr(param.control_model, 'aggressive_lowvram'):
                         param.control_model.aggressive_lowvram()
@@ -697,6 +758,7 @@ class UnetHook(nn.Module):
 
                 h = x
                 for i, module in enumerate(self.input_blocks):
+                    self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
                     h = module(h, emb, context)
 
                     t2i_injection = [3, 5, 8] if is_sdxl else [2, 5, 8, 11]
@@ -705,6 +767,8 @@ class UnetHook(nn.Module):
                         h = aligned_adding(h, total_t2i_adapter_embedding.pop(0), require_inpaint_hijack)
 
                     hs.append(h)
+
+                self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
                 h = self.middle_block(h, emb, context)
 
             # U-Net Middle Block
@@ -715,6 +779,7 @@ class UnetHook(nn.Module):
 
             # U-Net Decoder
             for i, module in enumerate(self.output_blocks):
+                self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
                 h = th.cat([h, aligned_adding(hs.pop(), total_controlnet_embedding.pop(), require_inpaint_hijack)], dim=1)
                 h = module(h, emb, context)
 
@@ -777,18 +842,23 @@ class UnetHook(nn.Module):
 
             return h
 
+        def move_all_control_model_to_cpu():
+            for param in getattr(outer, 'control_params', []):
+                if isinstance(param.control_model, torch.nn.Module):
+                    param.control_model.to("cpu")
+
         def forward_webui(*args, **kwargs):
             # webui will handle other compoments 
             try:
                 if shared.cmd_opts.lowvram:
                     lowvram.send_everything_to_cpu()
-
                 return forward(*args, **kwargs)
+            except Exception as e:
+                move_all_control_model_to_cpu()
+                raise e
             finally:
-                for param in self.control_params:
-                    if isinstance(param.control_model, torch.nn.Module):
-                        param.control_model.to("cpu")
-
+                if outer.lowvram:
+                    move_all_control_model_to_cpu()
 
         def hacked_basic_transformer_inner_forward(self, x, context=None):
             x_norm1 = self.norm1(x)
@@ -863,6 +933,7 @@ class UnetHook(nn.Module):
 
         if model_is_sdxl:
             register_schedule(sd_ldm)
+            outer.revision_q_sampler = AbstractLowScaleModel()
 
         need_attention_hijack = False
 
@@ -928,14 +999,11 @@ class UnetHook(nn.Module):
 
         scripts.script_callbacks.on_cfg_denoiser(self.guidance_schedule_handler)
 
-    def restore(self, model):
+    def restore(self):
         scripts.script_callbacks.remove_callbacks_for_function(self.guidance_schedule_handler)
-        if hasattr(self, "control_params"):
-            del self.control_params
+        self.control_params = None
 
-        if not hasattr(model, "_original_forward"):
-            # no such handle, ignore
-            return
-
-        model.forward = model._original_forward
-        del model._original_forward
+        if self.model is not None:
+            if hasattr(self.model, "_original_forward"):
+                self.model.forward = self.model._original_forward
+                del self.model._original_forward

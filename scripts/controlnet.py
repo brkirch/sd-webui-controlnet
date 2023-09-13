@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple
 import modules.scripts as scripts
 from modules import shared, devices, script_callbacks, processing, masking, images
 import gradio as gr
+import time
 
 
 from einops import rearrange
@@ -15,6 +16,7 @@ from scripts import global_state, hook, external_code, processor, batch_hijack, 
 from scripts.controlnet_lora import bind_control_lora, unbind_control_lora
 from scripts.processor import *
 from scripts.adapter import Adapter, StyleAdapter, Adapter_light
+from scripts.controlnet_lllite import PlugableControlLLLite, clear_all_lllite
 from scripts.controlmodel_ipadapter import PlugableIPAdapter, clear_all_ip_adapter
 from scripts.utils import load_state_dict, get_unique_axis0
 from scripts.hook import ControlParams, UnetHook, ControlModelType, HackedImageRNG
@@ -49,6 +51,11 @@ except ImportError:
 import tempfile
 gradio_tempfile_path = os.path.join(tempfile.gettempdir(), 'gradio')
 os.makedirs(gradio_tempfile_path, exist_ok=True)
+
+
+def clear_all_secondary_control_models():
+    clear_all_lllite()
+    clear_all_ip_adapter()
 
 
 def find_closest_lora_model_name(search: str):
@@ -426,41 +433,44 @@ class Script(scripts.Script, metaclass=(
                 inpaint_mask = x[:, :, 3]
                 x = x[:, :, 0:3]
 
-            new_size_is_smaller = (size[0] * size[1]) < (x.shape[0] * x.shape[1])
-            new_size_is_bigger = (size[0] * size[1]) > (x.shape[0] * x.shape[1])
-            unique_color_count = len(get_unique_axis0(x.reshape(-1, x.shape[2])))
-            is_one_pixel_edge = False
-            is_binary = False
-            if unique_color_count == 2:
-                is_binary = np.min(x) < 16 and np.max(x) > 240
-                if is_binary:
-                    xc = x
-                    xc = cv2.erode(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
-                    xc = cv2.dilate(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
-                    one_pixel_edge_count = np.where(xc < x)[0].shape[0]
-                    all_edge_count = np.where(x > 127)[0].shape[0]
-                    is_one_pixel_edge = one_pixel_edge_count * 2 > all_edge_count
+            if x.shape[0] != size[1] or x.shape[1] != size[0]:
+                new_size_is_smaller = (size[0] * size[1]) < (x.shape[0] * x.shape[1])
+                new_size_is_bigger = (size[0] * size[1]) > (x.shape[0] * x.shape[1])
+                unique_color_count = len(get_unique_axis0(x.reshape(-1, x.shape[2])))
+                is_one_pixel_edge = False
+                is_binary = False
+                if unique_color_count == 2:
+                    is_binary = np.min(x) < 16 and np.max(x) > 240
+                    if is_binary:
+                        xc = x
+                        xc = cv2.erode(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
+                        xc = cv2.dilate(xc, np.ones(shape=(3, 3), dtype=np.uint8), iterations=1)
+                        one_pixel_edge_count = np.where(xc < x)[0].shape[0]
+                        all_edge_count = np.where(x > 127)[0].shape[0]
+                        is_one_pixel_edge = one_pixel_edge_count * 2 > all_edge_count
 
-            if 2 < unique_color_count < 200:
-                interpolation = cv2.INTER_NEAREST
-            elif new_size_is_smaller:
-                interpolation = cv2.INTER_AREA
-            else:
-                interpolation = cv2.INTER_CUBIC  # Must be CUBIC because we now use nms. NEVER CHANGE THIS
-
-            y = cv2.resize(x, size, interpolation=interpolation)
-            if inpaint_mask is not None:
-                inpaint_mask = cv2.resize(inpaint_mask, size, interpolation=interpolation)
-
-            if is_binary:
-                y = np.mean(y.astype(np.float32), axis=2).clip(0, 255).astype(np.uint8)
-                if is_one_pixel_edge:
-                    y = nake_nms(y)
-                    _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    y = lvmin_thin(y, prunings=new_size_is_bigger)
+                if 2 < unique_color_count < 200:
+                    interpolation = cv2.INTER_NEAREST
+                elif new_size_is_smaller:
+                    interpolation = cv2.INTER_AREA
                 else:
-                    _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                y = np.stack([y] * 3, axis=2)
+                    interpolation = cv2.INTER_CUBIC  # Must be CUBIC because we now use nms. NEVER CHANGE THIS
+
+                y = cv2.resize(x, size, interpolation=interpolation)
+                if inpaint_mask is not None:
+                    inpaint_mask = cv2.resize(inpaint_mask, size, interpolation=interpolation)
+
+                if is_binary:
+                    y = np.mean(y.astype(np.float32), axis=2).clip(0, 255).astype(np.uint8)
+                    if is_one_pixel_edge:
+                        y = nake_nms(y)
+                        _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        y = lvmin_thin(y, prunings=new_size_is_bigger)
+                    else:
+                        _, y = cv2.threshold(y, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    y = np.stack([y] * 3, axis=2)
+            else:
+                y = x
 
             if inpaint_mask is not None:
                 inpaint_mask = (inpaint_mask > 127).astype(np.float32) * 255.0
@@ -627,12 +637,7 @@ class Script(scripts.Script, metaclass=(
                 setattr(unit, param, default_value)
                 logger.warning(f'[{unit.module}.{param}] Invalid value({value}), using default value {default_value}.')
 
-    def process(self, p, *args):
-        """
-        This function is called before processing begins for AlwaysVisible scripts.
-        You can modify the processing object (p) here, inject hooks, etc.
-        args contains all values returned by components from ui()
-        """
+    def controlnet_main_entry(self, p):
         sd_ldm = p.sd_model
         unet = sd_ldm.model.diffusion_model
         self.noise_modifier = None
@@ -641,7 +646,10 @@ class Script(scripts.Script, metaclass=(
 
         if self.latest_network is not None:
             # always restore (~0.05s)
-            self.latest_network.restore(unet)
+            self.latest_network.restore()
+
+        # always clear (~0.05s)
+        clear_all_secondary_control_models()
 
         if not batch_hijack.instance.is_batch:
             self.enabled_units = Script.get_enabled_units(p)
@@ -768,12 +776,14 @@ class Script(scripts.Script, metaclass=(
                 control_model_type = ControlModelType.AttentionInjection
             elif 'revision' in unit.module:
                 control_model_type = ControlModelType.ReVision
-            elif isinstance(model_net.control_model, Adapter) or isinstance(model_net.control_model, Adapter_light):
+            elif hasattr(model_net, 'control_model') and (isinstance(model_net.control_model, Adapter) or isinstance(model_net.control_model, Adapter_light)):
                 control_model_type = ControlModelType.T2I_Adapter
-            elif isinstance(model_net.control_model, StyleAdapter):
+            elif hasattr(model_net, 'control_model') and isinstance(model_net.control_model, StyleAdapter):
                 control_model_type = ControlModelType.T2I_StyleAdapter
             elif isinstance(model_net, PlugableIPAdapter):
                 control_model_type = ControlModelType.IPAdapter
+            elif isinstance(model_net, PlugableControlLLLite):
+                control_model_type = ControlModelType.Controlllite
 
             if control_model_type is ControlModelType.ControlNet:
                 global_average_pooling = model_net.control_model.global_average_pooling
@@ -929,15 +939,6 @@ class Script(scripts.Script, metaclass=(
         self.latest_network = UnetHook(lowvram=is_low_vram)
         self.latest_network.hook(model=unet, sd_ldm=sd_ldm, control_params=forward_params, process=p)
 
-        revision_conds = 0
-        revision_conds_weight = 0
-        for param in forward_params:
-            if param.control_model_type == ControlModelType.ReVision:
-                revision_conds = revision_conds + param.hint_cond * param.weight
-                revision_conds_weight += param.weight
-        revision_conds_weight = max(revision_conds_weight, 1e-3)
-        self.latest_network.global_revision = revision_conds / revision_conds_weight
-
         for param in forward_params:
             if param.control_model_type == ControlModelType.IPAdapter:
                 param.control_model.hook(
@@ -945,11 +946,36 @@ class Script(scripts.Script, metaclass=(
                     clip_vision_output=param.hint_cond,
                     weight=param.weight,
                     dtype=torch.float32,
-                    lowvram=is_low_vram
+                    start=param.start_guidance_percent,
+                    end=param.stop_guidance_percent
+                )
+            if param.control_model_type == ControlModelType.Controlllite:
+                param.control_model.hook(
+                    model=unet,
+                    cond=param.hint_cond,
+                    weight=param.weight,
+                    start=param.start_guidance_percent,
+                    end=param.stop_guidance_percent
                 )
 
         self.detected_map = detected_maps
         self.post_processors = post_processors
+
+    def controlnet_hack(self, p):
+        t = time.time()
+        self.controlnet_main_entry(p)
+        if len(self.enabled_units) > 0:
+            logger.info(f'ControlNet Hooked - Time = {time.time() - t}')
+        return
+
+    @staticmethod
+    def process_has_sdxl_refiner(p):
+        return getattr(p, 'refiner_checkpoint', None) is not None
+
+    def process(self, p, *args, **kwargs):
+        if not self.process_has_sdxl_refiner(p):
+            self.controlnet_hack(p)
+        return
 
     def before_process_batch(self, p, *args, **kwargs):
         if self.noise_modifier is not None:
@@ -957,6 +983,8 @@ class Script(scripts.Script, metaclass=(
                                    noise_modifier=self.noise_modifier,
                                    sd_model=p.sd_model)
         self.noise_modifier = None
+        if self.process_has_sdxl_refiner(p):
+            self.controlnet_hack(p)
         return
 
     def postprocess_batch(self, p, *args, **kwargs):
@@ -967,7 +995,7 @@ class Script(scripts.Script, metaclass=(
         return
 
     def postprocess(self, p, processed, *args):
-        clear_all_ip_adapter()
+        clear_all_secondary_control_models()
 
         self.noise_modifier = None
 
@@ -1013,7 +1041,7 @@ class Script(scripts.Script, metaclass=(
                             ])
 
         self.input_image = None
-        self.latest_network.restore(p.sd_model.model.diffusion_model)
+        self.latest_network.restore()
         self.latest_network = None
         self.detected_map.clear()
 
@@ -1045,7 +1073,7 @@ class Script(scripts.Script, metaclass=(
         self.input_image = None
         if self.latest_network is None: return
 
-        self.latest_network.restore(shared.sd_model.model.diffusion_model)
+        self.latest_network.restore()
         self.latest_network = None
         self.detected_map.clear()
 
